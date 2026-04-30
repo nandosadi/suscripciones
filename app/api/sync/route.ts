@@ -3,38 +3,70 @@ import { NextRequest } from 'next/server';
 export const runtime = 'nodejs';
 export const maxDuration = 300;
 
-/* ─── Anthropic API helper ───────────────────────────────── */
+/* ─── Types ──────────────────────────────────────────────── */
 
-interface McpServer {
-  type: 'url';
-  url: string;
-  name: string;
-  authorization_token?: string;
+interface EmailSummary {
+  subject: string;
+  date: string;
+  snippet: string;
 }
 
-async function callClaude(params: {
-  messages: Array<{ role: string; content: string }>;
-  mcpServers?: McpServer[];
-}): Promise<string> {
-  const body: Record<string, unknown> = {
-    model: 'claude-opus-4-5',
-    max_tokens: 8192,
-    messages: params.messages,
-  };
+/* ─── Gmail REST helpers ─────────────────────────────────── */
 
-  if (params.mcpServers?.length) {
-    body.mcp_servers = params.mcpServers;
+async function gmailSearch(token: string, query: string, maxResults = 50): Promise<string[]> {
+  const url =
+    'https://gmail.googleapis.com/gmail/v1/users/me/messages?' +
+    new URLSearchParams({ q: query, maxResults: String(maxResults) });
+
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (res.status === 401) throw new Error('Token de Google expirado. Vuelve a conectar Gmail.');
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Gmail API ${res.status}: ${text.slice(0, 200)}`);
   }
 
+  const data = await res.json();
+  return (data.messages ?? []).map((m: { id: string }) => m.id);
+}
+
+async function gmailGetMeta(token: string, id: string): Promise<EmailSummary | null> {
+  const url =
+    `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}` +
+    `?format=metadata&metadataHeaders=Subject&metadataHeaders=Date`;
+
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!res.ok) return null;
+
+  const data = await res.json();
+  const headers: Array<{ name: string; value: string }> = data.payload?.headers ?? [];
+  return {
+    subject: headers.find((h) => h.name === 'Subject')?.value ?? '',
+    date: headers.find((h) => h.name === 'Date')?.value ?? '',
+    snippet: data.snippet ?? '',
+  };
+}
+
+/* ─── Anthropic helper ───────────────────────────────────── */
+
+async function callClaude(messages: Array<{ role: string; content: string }>): Promise<string> {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'x-api-key': process.env.ANTHROPIC_API_KEY!,
       'anthropic-version': '2023-06-01',
-      'anthropic-beta': 'mcp-client-2025-04-04',
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      model: 'claude-opus-4-5',
+      max_tokens: 8192,
+      messages,
+    }),
   });
 
   if (!res.ok) {
@@ -77,66 +109,100 @@ export async function POST(req: NextRequest) {
       }
 
       try {
-        /* ── Guard ── */
+        /* ── Guards ── */
         if (!googleToken) {
           send({ type: 'log', msg: 'Token de Google no recibido. Conecta Gmail primero.', level: 'err' });
           send({ type: 'done', items: [] });
           controller.close();
           return;
         }
-
         if (!process.env.ANTHROPIC_API_KEY) {
-          send({ type: 'log', msg: 'ANTHROPIC_API_KEY no configurada en el servidor.', level: 'err' });
+          send({ type: 'log', msg: 'ANTHROPIC_API_KEY no configurada en Vercel.', level: 'err' });
           send({ type: 'done', items: [] });
           controller.close();
           return;
         }
 
-        /* ── Step 1: Extract transactions via Gmail MCP ── */
+        /* ── Step 1: Search Gmail ── */
         send({ type: 'log', msg: 'Conectando con Gmail…', level: 'info' });
-        send({ type: 'log', msg: 'Buscando correos de Bancolombia (últimos 90 días)…', level: 'info' });
 
-        const gmailMcp: McpServer = {
-          type: 'url',
-          url: 'https://gmailmcp.googleapis.com/mcp/v1',
-          name: 'gmail',
-          authorization_token: googleToken,
-        };
+        // Cast wide net — Bancolombia sends from various addresses
+        const query = 'bancolombia (compra OR transaccion OR debito OR pago) newer_than:90d';
+        let messageIds: string[];
 
-        const extractPrompt = `Usa las herramientas de Gmail disponibles para buscar correos de \
-notificaciones de transacciones de Bancolombia de los últimos 90 días.
+        try {
+          messageIds = await gmailSearch(googleToken, query, 50);
+        } catch (err) {
+          send({ type: 'log', msg: `${err instanceof Error ? err.message : String(err)}`, level: 'err' });
+          send({ type: 'done', items: [] });
+          controller.close();
+          return;
+        }
 
-Busca correos con asuntos como "Compra realizada", "Transacción exitosa", \
-"Notificación de pago", "Débito exitoso" o similares de Bancolombia.
+        send({
+          type: 'log',
+          msg: `Encontrados ${messageIds.length} correos candidatos`,
+          level: messageIds.length > 0 ? 'ok' : 'info',
+        });
 
-Para cada transacción encontrada extrae:
-- merchant: nombre del comercio o servicio (string)
-- amount: monto en COP como número (sin puntos, sin comas, sin símbolo $)
+        if (messageIds.length === 0) {
+          send({ type: 'log', msg: 'No hay correos de Bancolombia en los últimos 90 días.', level: 'info' });
+          send({ type: 'done', items: [] });
+          controller.close();
+          return;
+        }
+
+        /* ── Step 2: Fetch metadata in parallel (up to 40) ── */
+        send({ type: 'log', msg: 'Leyendo contenido de correos…', level: 'info' });
+
+        const toFetch = messageIds.slice(0, 40);
+        const metas = await Promise.all(toFetch.map((id) => gmailGetMeta(googleToken, id)));
+        const emails: EmailSummary[] = metas.filter((m): m is EmailSummary => m !== null);
+
+        send({ type: 'log', msg: `Procesando ${emails.length} correos…`, level: 'info' });
+
+        /* ── Step 3: Claude extracts transactions ── */
+        send({ type: 'log', msg: 'Extrayendo transacciones con IA…', level: 'info' });
+
+        const emailBlock = emails
+          .map((e, i) => `[${i + 1}] Asunto: ${e.subject}\nFecha: ${e.date}\nContenido: ${e.snippet}`)
+          .join('\n\n');
+
+        const extractPrompt = `Eres un asistente que extrae datos de transacciones bancarias de correos de Bancolombia Colombia.
+
+Analiza estos correos y extrae cada transacción de compra o débito:
+
+${emailBlock}
+
+Para cada transacción extrae:
+- merchant: nombre del comercio o servicio (string limpio, sin asteriscos ni ruido)
+- amount: monto en COP como número entero (sin puntos, comas ni $)
 - date: fecha en formato YYYY-MM-DD
 
-Devuelve ÚNICAMENTE un array JSON, sin texto adicional ni bloques de código:
+Reglas:
+- Ignora correos que no sean notificaciones de transacciones (ej: publicidad, estados de cuenta)
+- Si el monto aparece como "15.000" en español, el número es 15000
+- Si hay múltiples transacciones en un correo, extrae cada una por separado
+
+Devuelve ÚNICAMENTE un array JSON sin texto adicional:
 [{"merchant":"Netflix","amount":17900,"date":"2025-03-15"},...]
 
-Si no hay correos devuelve: []`;
+Si no hay transacciones claras devuelve: []`;
 
         let transactions: Array<{ merchant: string; amount: number; date: string }> = [];
 
         try {
-          const r1 = await callClaude({
-            messages: [{ role: 'user', content: extractPrompt }],
-            mcpServers: [gmailMcp],
-          });
-
+          const r1 = await callClaude([{ role: 'user', content: extractPrompt }]);
           transactions = extractArray(r1) as typeof transactions;
           send({
             type: 'log',
-            msg: `Encontradas ${transactions.length} transacciones en Gmail`,
+            msg: `Extraídas ${transactions.length} transacciones`,
             level: 'ok',
           });
         } catch (err) {
           send({
             type: 'log',
-            msg: `Error al leer Gmail: ${err instanceof Error ? err.message : String(err)}`,
+            msg: `Error al extraer transacciones: ${err instanceof Error ? err.message : String(err)}`,
             level: 'err',
           });
           send({ type: 'done', items: [] });
@@ -145,43 +211,41 @@ Si no hay correos devuelve: []`;
         }
 
         if (transactions.length === 0) {
-          send({ type: 'log', msg: 'No se encontraron transacciones de Bancolombia.', level: 'info' });
+          send({ type: 'log', msg: 'No se encontraron transacciones en los correos.', level: 'info' });
           send({ type: 'done', items: [] });
           controller.close();
           return;
         }
 
-        /* ── Step 2: Analyze for recurring subscriptions ── */
+        /* ── Step 4: Claude detects recurring subscriptions ── */
         send({
           type: 'log',
-          msg: `Analizando ${transactions.length} transacciones para detectar suscripciones…`,
+          msg: `Analizando recurrencia en ${transactions.length} transacciones…`,
           level: 'info',
         });
 
         const exclusion =
           (existingNames as string[]).length > 0
-            ? `\nExcluye estas suscripciones ya registradas: ${(existingNames as string[]).join(', ')}`
+            ? `\nExcluye estas que ya están registradas: ${(existingNames as string[]).join(', ')}`
             : '';
 
-        const analyzePrompt = `Analiza estas transacciones de Bancolombia y detecta suscripciones recurrentes:
+        const analyzePrompt = `Analiza estas transacciones de Bancolombia Colombia e identifica suscripciones recurrentes:
 
 ${JSON.stringify(transactions, null, 2)}
 
 Considera suscripción si:
 1. El mismo comercio aparece 2 o más veces con montos similares
-2. Es un servicio de suscripción conocido (Netflix, Spotify, YouTube Premium, \
-Amazon Prime, Disney+, Apple Music, Apple TV+, HBO Max, Paramount+, Adobe, \
-Microsoft 365, Dropbox, iCloud, ChatGPT, Midjourney, GitHub Copilot, etc.)
-3. Muestra patrón temporal regular (mensual ~30 días, anual ~365 días)
+2. Es un servicio de suscripción conocido (Netflix, Spotify, YouTube Premium, Amazon Prime, Disney+, Apple Music, Apple TV+, Max, Paramount+, Crunchyroll, Adobe Creative Cloud, Microsoft 365, Dropbox, iCloud+, Google One, ChatGPT Plus, Midjourney, GitHub Copilot, Duolingo, Canva, etc.)
+3. Muestra intervalo regular (~30 días para mensual, ~365 días para anual)
 ${exclusion}
 
-Para cada suscripción devuelve:
-- name: nombre limpio capitalizado (ej: "Netflix", "Spotify")
+Para cada suscripción detectada devuelve:
+- name: nombre limpio y capitalizado (ej: "Netflix", "Spotify", "Adobe Creative Cloud")
 - amount: monto más reciente en COP (número entero)
-- cycle: "mensual" o "anual"
-- lastCharge: fecha del último cargo YYYY-MM-DD
+- cycle: "mensual" o "anual" según el patrón observado
+- lastCharge: fecha del cargo más reciente YYYY-MM-DD
 
-Devuelve ÚNICAMENTE un array JSON, sin texto adicional:
+Devuelve ÚNICAMENTE un array JSON sin texto adicional:
 [{"name":"Netflix","amount":17900,"cycle":"mensual","lastCharge":"2025-03-15"},...]
 
 Si no hay suscripciones devuelve: []`;
@@ -194,14 +258,12 @@ Si no hay suscripciones devuelve: []`;
         }> = [];
 
         try {
-          const r2 = await callClaude({
-            messages: [{ role: 'user', content: analyzePrompt }],
-          });
+          const r2 = await callClaude([{ role: 'user', content: analyzePrompt }]);
           detected = extractArray(r2) as typeof detected;
         } catch (err) {
           send({
             type: 'log',
-            msg: `Error al analizar: ${err instanceof Error ? err.message : String(err)}`,
+            msg: `Error al analizar suscripciones: ${err instanceof Error ? err.message : String(err)}`,
             level: 'err',
           });
         }
@@ -215,7 +277,7 @@ Si no hay suscripciones devuelve: []`;
           msg:
             fresh.length > 0
               ? `✓ Detectadas ${fresh.length} nuevas suscripciones`
-              : 'No se detectaron nuevas suscripciones.',
+              : 'No se detectaron nuevas suscripciones recurrentes.',
           level: fresh.length > 0 ? 'ok' : 'info',
         });
 
